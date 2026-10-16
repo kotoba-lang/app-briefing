@@ -46,28 +46,19 @@
     (when (connected? (:state peer)) [:span {:class "connected-dot"}])]])
 
 (defn- local-cell []
-  [:div {:class "video-cell"}
-   [:div {:class "video-container"}
-    [:video (merge {:auto-play true :muted true :plays-inline true}
-                   {:ref (fn [el]
-                           (when el
-                             (reset! state/local-video-el el)
-                             (when @state/local-stream
-                               (set! (.-srcObject el) @state/local-stream))))})]
-    (when (or (nil? @state/local-stream) @state/video-off)
-      [:div {:class "video-placeholder"} "You"])]
-   [:div {:class "video-label"} (str (or (str/trim @state/display-name) state/my-peer-id) " (You)")]])
-
-(defn- rec-label []
-  (if @state/is-recording
-    (let [d @state/recording-duration
-          mm (js/Math.floor (/ d 60))
-          ss (.padStart (str (mod d 60)) 2 "0")]
-      (str "Stop (" mm ":" ss ")"))
-    (if (and (not (empty? @state/recording-status))
-             (not (contains? #{"done" "recording"} @state/recording-status)))
-      (str @state/recording-status "...")
-      "Record")))
+  (let [entered-name (str/trim @state/display-name)
+        display-name (if (str/blank? entered-name) state/my-peer-id entered-name)]
+    [:div {:class "video-cell"}
+     [:div {:class "video-container"}
+      [:video (merge {:auto-play true :muted true :plays-inline true}
+                     {:ref (fn [el]
+                             (when el
+                               (reset! state/local-video-el el)
+                               (when @state/local-stream
+                                 (set! (.-srcObject el) @state/local-stream))))})]
+      (when (or (nil? @state/local-stream) @state/video-off)
+        [:div {:class "video-placeholder"} "You"])]
+     [:div {:class "video-label"} (str display-name " (You)")]]))
 
 (defn- joined-panel []
   [:section {:class "panel"}
@@ -75,7 +66,7 @@
     [:h2 (str "Room: " @state/room-id)]
     [:span {:class "peer-count"} (str (count @state/remote-peers) " peer"
                                       (when (not= 1 (count @state/remote-peers)) "s"))]
-    (when @state/convo-id
+    (when-not (str/blank? @state/convo-id)
       [:span {:class "badge project-badge"} "Project"])
     [:button {:class "btn danger" :on-click state/leave-room} "Leave"]]
    [:div {:class "video-grid"}
@@ -92,21 +83,19 @@
                  :on-click state/toggle-video}
         (if @state/video-off "Camera On" "Camera Off")]]
       [:button {:class "btn primary" :on-click state/retry-media} "Allow Camera & Mic"])
-    [:button {:class (str "btn" (when @state/is-recording " recording"))
-              :on-click state/toggle-recording
-              :disabled (contains? #{"uploading" "transcribing" "translating"} @state/recording-status)}
-     (rec-label)]]])
+    [:p {:class "media-warn"}
+     "Recording is disabled until every participant can explicitly consent and revoke consent."]]])
 
 (defn- actors-panel []
   [:section {:class "panel actors-panel"}
-   [:h3 (str "Project Actors (" (count state/project-actors) " DIDs)")]
+   [:h3 (str "Project Actors (" (count @state/project-actors) " DIDs)")]
    [:div {:class "actor-list"}
     (map (fn [actor]
            ^{:key (:did actor)}
            [:div {:class "actor-item"}
             [:span {:class "actor-role"} (:role actor)]
             [:span {:class "actor-did"} (last (str/split (:did actor) #":"))]])
-         state/project-actors)]])
+         @state/project-actors)]])
 
 (defn- transcript-panel []
   (when-let [t @state/transcript]

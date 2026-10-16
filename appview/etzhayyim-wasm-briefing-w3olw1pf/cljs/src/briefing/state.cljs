@@ -5,18 +5,18 @@
 ;; Port of App.svelte state (WebRTC briefing room).
 
 (def SIGNAL_URL "wss://briefing-signal.etzhayyim.com")
-(def SIGNAL_HTTP "https://briefing-signal.etzhayyim.com")
 
 (def ice-servers
   #js [#js {:urls "stun:stun.l.google.com:19302"}
        #js {:urls "stun:stun1.l.google.com:19302"}
        #js {:urls "stun:stun.cloudflare.com:3478"}])
 
-(def project-actors
+(def available-project-actors
   [{:did "did:web:briefing.etzhayyim.com:actor:transcriber" :role "Transcription" :description "Speech-to-text via Whisper"}
    {:did "did:web:briefing.etzhayyim.com:actor:translator" :role "Translation" :description "Auto-translate via LLM"}
    {:did "did:web:briefing.etzhayyim.com:actor:recorder" :role "Recording" :description "Audio recording + R2 storage"}
    {:did "did:web:briefing.etzhayyim.com:actor:summarizer" :role "Summarizer" :description "Meeting summary generation"}])
+(def project-actors (reagent/atom [])) ; actors are shown only after createRoom succeeds
 
 (def my-peer-id (str "peer-" (.slice (.toString (js/Math.random) 36) 2 8)))
 
@@ -51,7 +51,7 @@
 ;; Forward declarations (mutually recursive logic).
 (declare connect-signaling create-peer-connection handle-offer handle-answer
          handle-ice-candidate request-media leave-room stop-recording
-         start-recording process-recording create-project)
+         create-project)
 
 (defn set-peer [peer-id patch]
   (swap! remote-peers (fn [m]
@@ -72,7 +72,12 @@
 (declare handle-offer handle-answer handle-ice-candidate request-media)
 
 (defn handle-signal [msg]
-  (case (:type msg)
+  (let [raw-type (:type msg)
+        type (cond
+               (keyword? raw-type) raw-type
+               (string? raw-type) (keyword raw-type)
+               :else nil)]
+  (case type
     :peers (do (log (str (count (:peers msg)) " peer(s) in room"))
                (reduce (fn [acc p]
                          (let [pid (str (:peerId p))]
@@ -90,7 +95,7 @@
     :answer (do (log (str "Answer from " (:name (get @remote-peers (str (:from msg))))))
                 (handle-answer (str (:from msg)) (str (:sdp msg))))
     :ice-candidate (handle-ice-candidate (str (:from msg)) (:candidate msg))
-    nil))
+    nil)))
 
 ;; ── Step 3: WebRTC peer connections ──
 
@@ -99,7 +104,7 @@
     (let [pc (new js/RTCPeerConnection #js {:iceServers ice-servers})]
       (vswap! peer-connections assoc peer-id pc)
       (if @local-stream
-        (doseq [track (js->clj (.getTracks @local-stream))]
+        (doseq [track (array-seq (.getTracks @local-stream))]
           (.addTrack pc track @local-stream))
         (do (.addTransceiver pc "audio" #js {:direction "recvonly"})
             (.addTransceiver pc "video" #js {:direction "recvonly"})))
@@ -110,7 +115,7 @@
       (set! (.-ontrack pc)
             (fn [ev]
               (log (str "Track: " (.-kind (.-track ev)) " from " (:name (get @remote-peers peer-id))))
-              (set-peer peer-id {:stream (or (first (js->clj (.-streams ev)))
+              (set-peer peer-id {:stream (or (first (array-seq (.-streams ev)))
                                              (new js/MediaStream #js [(.-track ev)]))
                                  :state "connected"})))
       (set! (.-oniceconnectionstatechange pc)
@@ -127,26 +132,31 @@
               (when (or is-initiator (= "stable" (.-signalingState pc)))
                 (-> (.createOffer pc)
                     (.then (fn [offer]
-                             (.setLocalDescription pc offer)
-                             (send-signal {:type "offer" :to peer-id :sdp (.-sdp offer)})))
+                             (.setLocalDescription pc offer)))
+                    (.then (fn []
+                             (send-signal {:type "offer" :to peer-id
+                                           :sdp (.-sdp (.-localDescription pc))})))
                     (.catch (fn [e] (js/console.warn "[rtc] renegotiation error:" e)))))))
       (when is-initiator
         (-> (.createOffer pc)
             (.then (fn [offer]
-                     (.setLocalDescription pc offer)
-                     (send-signal {:type "offer" :to peer-id :sdp (.-sdp offer)}))))))))
+                     (.setLocalDescription pc offer)))
+            (.then (fn []
+                     (send-signal {:type "offer" :to peer-id
+                                   :sdp (.-sdp (.-localDescription pc))})))
+            (.catch (fn [e] (js/console.warn "[rtc] initial offer error:" e))))))))
 
 (defn handle-offer [from sdp]
-  (-> (js/Promise.resolve
-        (when-not (contains? (deref peer-connections) from)
-          (create-peer-connection from false)))
-      (.then (fn []
-               (let [pc (get (deref peer-connections) from)]
-                 (.setRemoteDescription pc #js {:type "offer" :sdp sdp})
-                 (.then (.createAnswer pc)
-                        (fn [answer]
-                          (.setLocalDescription pc answer)
-                          (send-signal {:type "answer" :to from :sdp (.-sdp answer)}))))))))
+  (when-not (contains? (deref peer-connections) from)
+    (create-peer-connection from false))
+  (when-let [pc (get (deref peer-connections) from)]
+    (-> (.setRemoteDescription pc #js {:type "offer" :sdp sdp})
+        (.then (fn [] (.createAnswer pc)))
+        (.then (fn [answer] (.setLocalDescription pc answer)))
+        (.then (fn []
+                 (send-signal {:type "answer" :to from
+                               :sdp (.-sdp (.-localDescription pc))})))
+        (.catch (fn [e] (js/console.warn "[rtc] answer error:" e))))))
 
 (defn handle-answer [from sdp]
   (when-let [pc (get (deref peer-connections) from)]
@@ -161,17 +171,26 @@
 
 ;; ── Step 1: media ──
 
-(defn try-media [specs]
+(defn try-media [specs join-after-media?]
   (if (empty? specs)
     (let [msg "No camera/mic found on this device."]
       (reset! media-error msg)
-      (log (str "Media: " msg)))
+      (log (str "Media: " msg))
+      (when join-after-media? (connect-signaling)))
     (-> (js/navigator.mediaDevices.getUserMedia (first specs))
         (.then (fn [stream]
                  (reset! local-stream stream)
+                 (reset! media-error "")
+                 (when-let [el @local-video-el]
+                   (set! (.-srcObject el) stream))
                  (log (case (count specs) 3 "Camera + mic ready" 2 "Mic only (no camera)" "Camera only (no mic)"))
-                 (connect-signaling)))
-        (.catch (fn [_] (try-media (rest specs)))))))
+                 (if join-after-media?
+                   (connect-signaling)
+                   (doseq [[peer-id pc] (deref peer-connections)]
+                     (doseq [track (array-seq (.getTracks stream))]
+                       (.addTrack pc track stream))
+                     (log (str "Added local media to " peer-id))))))
+        (.catch (fn [_] (try-media (rest specs) join-after-media?))))))
 
 (defn request-media []
   (when (empty? (str/trim @room-id))
@@ -180,19 +199,21 @@
   (reset! media-error "")
   (try-media [#js {:audio true :video true}
               #js {:audio true :video false}
-              #js {:audio false :video true}]))
+              #js {:audio false :video true}]
+             true))
 
 (defn retry-media []
   (reset! media-error "")
-  (reset! status :media)
   (try-media [#js {:audio true :video true}
               #js {:audio true :video false}
-              #js {:audio false :video true}]))
+              #js {:audio false :video true}]
+             false))
 
 ;; ── Step 2: WebSocket signaling ──
 
 (defn connect-signaling []
-  (let [name (or (str/trim @display-name) my-peer-id)
+  (let [entered-name (str/trim @display-name)
+        name (if (str/blank? entered-name) my-peer-id entered-name)
         url (str SIGNAL_URL "/rooms/" (js/encodeURIComponent @room-id) "/ws")]
     (log (str "Connecting to room: " @room-id))
     (reset! status :joining)
@@ -218,19 +239,27 @@
 ;; ── Convo project ──
 
 (defn create-project []
-  (when-not @convo-id
+  (when (str/blank? @convo-id)
     (-> (js/fetch "/xrpc/com.etzhayyim.apps.briefing.createRoom"
                   (clj->js {:method "POST"
                             :headers {"Content-Type" "application/json"}
                             :body (js/JSON.stringify
                                    (clj->js {:roomId @room-id
                                              :name (str "Briefing: " @room-id)
-                                             :actors (mapv :did project-actors)}))}))
-        (.then (fn [_]
-                 (reset! convo-id @room-id)
-                 (log (str "Project: " @room-id " (" (count project-actors) " actors)"))
-                 (doseq [a project-actors]
-                   (log (str "  Actor: " (:role a) " → " (:did a))))))
+                                             :actors (mapv :did available-project-actors)}))}))
+        (.then (fn [response]
+                 (when-not (.-ok response)
+                   (throw (js/Error. (str "createRoom HTTP " (.-status response)))))
+                 (.json response)))
+        (.then (fn [body]
+                 (let [result (js->clj body :keywordize-keys true)]
+                   (when-not (:ok result)
+                     (throw (js/Error. (str "createRoom refused: " (:error result)))))
+                   (reset! convo-id @room-id)
+                   (reset! project-actors available-project-actors)
+                   (log (str "Project: " @room-id " (" (count available-project-actors) " actors)"))
+                   (doseq [a available-project-actors]
+                     (log (str "  Actor: " (:role a) " → " (:did a)))))))
         (.catch (fn [e] (log (str "Project: " (.-message e))))))))
 
 (defn leave-room []
@@ -239,90 +268,47 @@
   (doseq [id (keys (deref peer-connections))] (close-peer-connection id))
   (reset! remote-peers {})
   (when @local-stream
-    (doseq [t (js->clj (.getTracks @local-stream))] (.stop t))
+    (doseq [t (array-seq (.getTracks @local-stream))] (.stop t))
     (reset! local-stream nil))
   (when @is-recording (stop-recording))
   (reset! status :idle)
   (reset! media-error "")
   (reset! recording-status "")
   (reset! transcript nil)
-  (reset! convo-id ""))
+  (reset! convo-id "")
+  (reset! project-actors []))
 
 (defn toggle-mute []
   (when @local-stream
-    (when-let [t (first (js->clj (.getAudioTracks @local-stream)))]
+    (when-let [t (first (array-seq (.getAudioTracks @local-stream)))]
       (set! (.-enabled t) (not (.-enabled t)))
       (reset! audio-muted (not (.-enabled t))))))
 
 (defn toggle-video []
   (when @local-stream
-    (when-let [t (first (js->clj (.getVideoTracks @local-stream)))]
+    (when-let [t (first (array-seq (.getVideoTracks @local-stream)))]
       (set! (.-enabled t) (not (.-enabled t)))
       (reset! video-off (not (.-enabled t))))))
 
+;; The repository governance requires explicit consent from every participant
+;; and immediate pause on revocation. The signaling service has no verified
+;; consent protocol, so this client must not capture or upload meeting audio.
 (defn toggle-recording []
-  (if @is-recording (stop-recording) (start-recording)))
-
-(defn start-recording []
-  (let [ctx (new js/AudioContext)
-        dest (.createMediaStreamDestination ctx)]
-    (when @local-stream
-      (when-let [la (first (js->clj (.getAudioTracks @local-stream)))]
-        (.connect (.createMediaStreamSource ctx (new js/MediaStream #js [la])) dest)))
-    (doseq [[_ peer] @remote-peers]
-      (when-let [st (:stream peer)]
-        (when-let [ra (first (js->clj (.getAudioTracks st)))]
-          (.connect (.createMediaStreamSource ctx (new js/MediaStream #js [ra])) dest))))
-    (let [mime (if (.isTypeSupported js/MediaRecorder "audio/webm;codecs=opus")
-                 "audio/webm;codecs=opus" "audio/webm")
-          mr (new js/MediaRecorder (.-stream dest) #js {:mimeType mime})]
-      (reset! recording-chunks [])
-      (reset! media-recorder mr)
-      (set! (.-ondataavailable mr)
-            (fn [ev] (when (pos? (.-size (.-data ev)))
-                       (swap! recording-chunks conj (.-data ev)))))
-      (set! (.-onstop mr) (fn [] (process-recording)))
-      (.start mr 1000)))
-  (reset! is-recording true)
-  (reset! recording-duration 0)
-  (reset! recording-status "recording")
-  (reset! recording-timer (js/setInterval #(swap! recording-duration inc) 1000))
-  (log "Recording started"))
-
-(defn process-recording []
-  (let [chunks @recording-chunks
-        n (count chunks)]
-    (reset! recording-status "uploading")
-    (if (zero? n)
-      (do (log "Recording: no audio captured")
-          (reset! recording-status ""))
-      (let [blob (new js/Blob (to-array chunks) #js {:type "audio/webm"})
-            fd (new js/FormData)]
-        (.append fd "audio" blob "briefing.webm")
-        (.append fd "roomId" @room-id)
-        (.append fd "peerId" my-peer-id)
-        (-> (js/fetch "/xrpc/com.etzhayyim.apps.briefing.uploadRecording"
-                      #js {:method "POST" :body fd})
-            (.then (fn [res]
-                     (if (.-ok res)
-                       (-> (.json res)
-                           (.then (fn [j]
-                                    (reset! transcript (js->clj j :keywordize-keys true))
-                                    (reset! recording-status "done")
-                                    (log (str "Transcript ready (" (:language (js->clj j :keywordize-keys true)) ")"))))
-                           (.catch (fn [_] (reset! recording-status "done"))))
-                       (do (log (str "Upload failed: " (.-status res)))
-                           (reset! recording-status "")))))
-            (.catch (fn [e]
-                      (log (str "Upload error: " (.-message e)))
-                      (reset! recording-status ""))))))))
-
+  (if @is-recording
+    (stop-recording)
+    (log "Recording is disabled until every participant can explicitly consent and revoke consent.")))
 
 (defn stop-recording []
-  (when (and @media-recorder (= "recording" (.-state @media-recorder)))
-    (.stop @media-recorder))
+  (when-let [mr @media-recorder]
+    (set! (.-ondataavailable mr) nil)
+    (set! (.-onstop mr) nil)
+    (when (= "recording" (.-state mr))
+      (.stop mr)))
+  (reset! media-recorder nil)
+  (reset! recording-chunks [])
   (when @recording-timer
     (js/clearInterval @recording-timer)
     (reset! recording-timer nil))
   (reset! is-recording false)
-  (log (str "Recording stopped (" @recording-duration "s)")))
+  (reset! recording-status "")
+  (log "Recording discarded; this client has no unanimous-consent flow"))
