@@ -1,0 +1,86 @@
+(ns briefing.room
+  "briefing（会議）判定コア — itonami dapp bundle（pure, :effects #{}）。
+
+  WebRTC マルチアクター会議のルーム・アジェンダ判定（正本:
+  kotoba/src/registry.ts + types.ts。PII Tier 3 — 録音・議事は暗号封筒の中）:
+
+  - **RoomTopology**（2）: mesh / sfu。**RoomStatus**（2）: active / closed。
+  - **DecisionMethod**（2）: vote / consensus。
+  - **ActionItemStatus**（3）: open / done / cancelled。
+  - ルーム作成は roomId + name 必須、**maxParticipants は非負整数かつ 1 以上**
+    （0 人の会議室は無い = invalidMaxParticipants）。
+  - アジェンダ項目は ordinal / allocatedSeconds が非負整数 + ルームの存在。
+  - 議事議事録・録音・アクション・決定は **E2E 暗号封筒の inner-type**
+    （transcript / recordingAsset / actionItem / decision）。
+
+  room-status-ok: 1 = 0..1（active/closed）/ topology-ok: 1 = 0..1（mesh/sfu）
+  decision-method-ok: 1 = 0..1（vote/consensus）
+  action-status-ok: 1 = 0..2（open/done/cancelled）
+  room-create の戻り: 0 = 作成可 / 1 = missingRequiredFields
+    / 2 = invalidMaxParticipants
+  agenda-admission の戻り: 0 = 記録可 / 1 = missingRequiredFields
+    / 2 = invalidOrdinal・invalidAllocatedSeconds / 3 = roomNotFound
+
+  実行 host はスカラーのみ = KIR v3 / i64/direct ABI（kernel/selfhost 両対応）。
+
+  テストはゼロ引数 test-*、戻り 1/0:
+  <amu> test aiueos/briefing_room.cljk"
+  (:export [main room-status-ok topology-ok decision-method-ok action-status-ok
+            room-create agenda-admission test-closed-sets test-room
+            test-room-cap test-agenda test-fail-closed]))
+
+(defn main [] :i64
+  0)
+
+(defn room-status-ok [code :i64] :i64
+  (if (and (>= code 0) (<= code 1)) 1 0))
+
+(defn topology-ok [code :i64] :i64
+  (if (and (>= code 0) (<= code 1)) 1 0))
+
+(defn decision-method-ok [code :i64] :i64
+  (if (and (>= code 0) (<= code 1)) 1 0))
+
+(defn action-status-ok [code :i64] :i64
+  (if (and (>= code 0) (<= code 2)) 1 0))
+
+(defn room-create [has-required :i64 max-participants :i64] :i64
+  (if (= has-required 0)
+    1
+    (if (>= max-participants 1) 0 2)))
+
+(defn agenda-admission [has-required :i64 ordinal-uint :i64 seconds-uint :i64 has-room :i64] :i64
+  (if (= has-required 0)
+    1
+    (if (or (= ordinal-uint 0) (= seconds-uint 0))
+      2
+      (if (= has-room 1) 0 3))))
+
+;; --- tests（戻り 1 = pass） ------------------------------------------------
+
+(defn test-closed-sets [] :i64
+  ;; mesh/sfu × active/closed × vote/consensus × open/done/cancelled
+  (if (= (+ (room-status-ok 0) (room-status-ok 1) (room-status-ok 2)
+            (topology-ok 1) (topology-ok 2)
+            (decision-method-ok 0) (decision-method-ok 2)
+            (action-status-ok 2) (action-status-ok 3))
+         5)
+    1 0))
+
+(defn test-room [] :i64
+  (if (= (+ (room-create 1 8) (room-create 0 8) (room-create 1 0)) 3) 1 0))
+
+(defn test-room-cap [] :i64
+  ;; maxParticipants は 1 以上（0 人の会議室は無い）
+  (if (= (+ (room-create 1 1) (room-create 1 -3)) 2) 1 0))
+
+(defn test-agenda [] :i64
+  ;; 拒否順: 必須 → ordinal/seconds → ルームの存在
+  (if (= (+ (agenda-admission 1 1 1 1) (agenda-admission 0 1 1 1)
+            (agenda-admission 1 0 1 1) (agenda-admission 1 1 1 0))
+         6)
+    1 0))
+
+(defn test-fail-closed [] :i64
+  ;; 集合外の status / method / topology は拒否
+  (if (= (+ (room-status-ok 9) (decision-method-ok 7) (topology-ok 5)) 0) 1 0))

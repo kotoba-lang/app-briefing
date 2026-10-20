@@ -1,0 +1,27 @@
+(ns briefing.room-parity-test
+  "aiueos/briefing_room.cljk（判定コア）と正本（registry.ts / types.ts）の
+  parity。閉じた集合・maxParticipants 規則・E2E inner-type が変われば落ちる。"
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            ["fs" :as fs]))
+
+(def types-src
+  (fs/readFileSync (str/join "/" ["kotoba" "src" "types.ts"]) "utf8"))
+(def registry
+  (fs/readFileSync (str/join "/" ["kotoba" "src" "registry.ts"]) "utf8"))
+
+(deftest closed-sets-match-guest
+  (testing "guest test-closed-sets: RoomTopology / RoomStatus / DecisionMethod / ActionItemStatus"
+    (doseq [s ["mesh" "sfu" "active" "closed" "vote" "consensus" "open" "done" "cancelled"]]
+      (is (str/includes? types-src s)))))
+
+(deftest admission-rules-match-guest
+  (testing "guest test-room / test-room-cap: maxParticipants は 1 以上"
+    (is (str/includes? registry "invalidMaxParticipants"))
+    (is (str/includes? registry "maxParticipants < 1")))
+  (testing "guest test-agenda: ordinal / allocatedSeconds / room の存在"
+    (is (str/includes? registry "invalidOrdinal"))
+    (is (str/includes? registry "invalidAllocatedSeconds")))
+  (testing "guest の境界: 録音・議事は E2E inner-type（PII Tier 3）"
+    (is (str/includes? types-src "recordingAsset"))
+    (is (str/includes? types-src "transcript"))))

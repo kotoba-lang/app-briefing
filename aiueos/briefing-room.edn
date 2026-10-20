@@ -1,0 +1,21 @@
+;; app-briefing — itonami（dapp）の aiueos アプリ記述子（notes.edn 形）。
+;; 判定コアは aiueos/briefing_room.cljk（ルーム・アジェンダ判定）。
+;; 正本は kotoba/src/registry.ts + types.ts。pure（:effects #{}）。
+;; PII Tier 3: 録音・議事・アクション・決定は E2E 暗号封筒の inner-type。
+{:aiueos/component :app/briefing-room
+ :aiueos/kind :app
+ :aiueos/trust :untrusted
+ :aiueos/source "briefing_room.cljk"
+ :aiueos/wasm "briefing_room.wasm"
+ :aiueos/entry "main"
+ :aiueos/args []
+ :aiueos/imports #{}
+ :aiueos/exports #{:app/main
+                   :app/room-status-ok
+                   :app/topology-ok
+                   :app/decision-method-ok
+                   :app/action-status-ok
+                   :app/room-create
+                   :app/agenda-admission}
+ :aiueos/effects #{}
+ :aiueos/limits {:memory-pages 16 :fuel 5000000}}
